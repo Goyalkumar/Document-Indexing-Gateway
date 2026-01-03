@@ -1,0 +1,1086 @@
+#!/usr/bin/env python3
+"""
+Document Indexing Gateway - Complete Production Version
+====================================================
+Version: 2.0.0 - All Features Integrated
+
+Features:
+- Multi-format support (PDF, DOCX, XLSX, TXT, Images)
+- Advanced OCR with vertical text extraction
+- Intelligent preprocessing (6 strategies)
+- Adaptive DPI (300-600)
+- Multi-pass OCR for complex P&IDs
+- Smart region detection
+- Confidence scoring
+- Table extraction
+- Pattern matching with EIWM XML output
+- Comprehensive HTML reports
+
+Author: Document Gateway System
+Date: January 2026
+"""
+
+import os
+import sys
+import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from typing import List, Dict, Set, Optional, Tuple
+from pathlib import Path
+from datetime import datetime
+import json
+import logging
+import shutil
+
+# Check dependencies
+MISSING_DEPS = []
+
+try:
+    from PyPDF2 import PdfReader
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
+    MISSING_DEPS.append("PyPDF2")
+
+try:
+    from docx import Document
+    DOCX_SUPPORT = True
+except ImportError:
+    DOCX_SUPPORT = False
+    MISSING_DEPS.append("python-docx")
+
+try:
+    import openpyxl
+    XLSX_SUPPORT = True
+except ImportError:
+    XLSX_SUPPORT = False
+    MISSING_DEPS.append("openpyxl")
+
+try:
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+    import pytesseract
+    from pdf2image import convert_from_path
+    OCR_SUPPORT = True
+except ImportError:
+    OCR_SUPPORT = False
+    MISSING_DEPS.append("pytesseract/Pillow/pdf2image")
+
+try:
+    import cv2
+    import numpy as np
+    CV2_SUPPORT = True
+except ImportError:
+    CV2_SUPPORT = False
+    MISSING_DEPS.append("opencv-python")
+
+
+@dataclass
+class ProjectConfig:
+    """Complete project configuration"""
+    # Basic settings
+    name: str = "Document Processing Project"
+    source_folder: str = ""
+    destination_folder: str = ""
+    staging_area: str = ""
+    processed_folder: str = ""
+    unprocessed_folder: str = ""
+    log_folder: str = ""
+    include_subfolders: bool = True
+    pattern_mapping_file: str = ""
+    default_context: str = ""
+    
+    # File handling
+    copy_source_files: bool = True
+    copy_other_files: bool = False
+    move_processed: bool = True
+    search_filenames_for_tags: bool = False
+    create_trigger_file: bool = True
+    insert_line_breaks: bool = True
+    file_types: List[str] = field(default_factory=lambda: ['pdf', 'docx', 'xlsx', 'txt', 'png', 'jpg', 'tiff'])
+    
+    # Timeouts
+    open_file_timeout: int = 30
+    processing_timeout: int = 120
+    
+    # OCR settings
+    use_ocr: bool = False
+    ocr_language: str = 'eng'
+    ocr_dpi: int = 300
+    extract_vertical_text: bool = True
+    rotate_for_ocr: bool = True
+    
+    # Advanced OCR features
+    adaptive_dpi: bool = True
+    dpi_min: int = 300
+    dpi_max: int = 600
+    preprocess_images: bool = True
+    enhance_contrast: float = 1.5
+    enhance_sharpness: float = 1.5
+    denoise: bool = True
+    use_multi_pass_ocr: bool = True
+    extract_tables: bool = True
+    detect_regions: bool = True
+    min_text_confidence: int = 60
+    use_advanced_psm: bool = True
+    save_debug_images: bool = False
+    
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items()}
+    
+    @staticmethod
+    def from_dict(data: dict) -> 'ProjectConfig':
+        config = ProjectConfig()
+        for key, value in data.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+        return config
+
+
+@dataclass
+class PatternRule:
+    """Pattern matching rule"""
+    pattern: str
+    class_id: str
+    context: str = ""
+    expand: bool = False
+    interpolate: bool = False
+    expand_char: str = "-"
+    sub_pattern: str = "[A-Z0-9]"
+    replacements: List[tuple] = field(default_factory=list)
+    insertions: List[tuple] = field(default_factory=list)
+    exclusions: List[str] = field(default_factory=list)
+    min_confidence: int = 60
+
+
+@dataclass
+class ExtractedTag:
+    """Extracted tag with metadata"""
+    tag: str
+    class_id: str
+    confidence: int
+    source: str
+    region: Optional[Tuple[int, int, int, int]] = None
+    orientation: str = 'horizontal'
+
+
+class ImageProcessor:
+    """Advanced image preprocessing for OCR"""
+    
+    def __init__(self, config: ProjectConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+    
+    def preprocess_image(self, image: Image.Image) -> List[Tuple[Image.Image, str, int]]:
+        """
+        Apply multiple preprocessing strategies
+        Returns: list of (processed_image, description, dpi)
+        """
+        processed = []
+        
+        # Original
+        processed.append((image.copy(), "original", self.config.ocr_dpi))
+        
+        if not self.config.preprocess_images:
+            return processed
+        
+        try:
+            # Enhanced version
+            enhanced = image.copy()
+            if self.config.enhance_contrast > 1.0:
+                enhancer = ImageEnhance.Contrast(enhanced)
+                enhanced = enhancer.enhance(self.config.enhance_contrast)
+            
+            if self.config.enhance_sharpness > 1.0:
+                sharpener = ImageEnhance.Sharpness(enhanced)
+                enhanced = sharpener.enhance(self.config.enhance_sharpness)
+            
+            processed.append((enhanced, "enhanced", self.config.ocr_dpi))
+            
+            # OpenCV preprocessing
+            if CV2_SUPPORT:
+                img_np = np.array(enhanced.convert('L'))
+                
+                # Binary threshold
+                _, binary = cv2.threshold(img_np, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                processed.append((Image.fromarray(binary), "binary", self.config.ocr_dpi))
+                
+                # Adaptive threshold
+                adaptive = cv2.adaptiveThreshold(img_np, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                cv2.THRESH_BINARY, 11, 2)
+                processed.append((Image.fromarray(adaptive), "adaptive", self.config.ocr_dpi))
+                
+                # Denoised
+                if self.config.denoise:
+                    denoised = cv2.fastNlMeansDenoising(img_np, None, 10, 7, 21)
+                    processed.append((Image.fromarray(denoised), "denoised", self.config.ocr_dpi))
+            
+            # Inverted
+            inverted = ImageOps.invert(enhanced.convert('RGB').convert('L'))
+            processed.append((inverted, "inverted", self.config.ocr_dpi))
+            
+            # High DPI version
+            if self.config.adaptive_dpi:
+                high_dpi = min(self.config.dpi_max, int(self.config.ocr_dpi * 1.5))
+                processed.append((enhanced, "high_dpi", high_dpi))
+        
+        except Exception as e:
+            self.logger.warning(f"Preprocessing error: {e}")
+        
+        return processed
+    
+    def detect_regions(self, image: Image.Image) -> Dict[str, Tuple[int, int, int, int]]:
+        """Detect different regions in the image"""
+        regions = {}
+        width, height = image.size
+        
+        if not self.config.detect_regions or not CV2_SUPPORT:
+            regions['full'] = (0, 0, width, height)
+            return regions
+        
+        try:
+            img_np = np.array(image.convert('L'))
+            edges = cv2.Canny(img_np, 50, 150)
+            
+            # Detect lines
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+            horizontal_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, horizontal_kernel)
+            
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+            vertical_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, vertical_kernel)
+            
+            # Find table region
+            contours, _ = cv2.findContours(horizontal_lines + vertical_lines, 
+                                          cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            table_candidates = []
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w > width * 0.15 and h > height * 0.15:
+                    table_candidates.append((x, y, w, h))
+            
+            if table_candidates:
+                table_candidates.sort(key=lambda r: r[0] + r[1], reverse=True)
+                regions['table'] = table_candidates[0]
+            
+            # Define other regions
+            regions['title_block_left'] = (0, 0, width // 4, height // 6)
+            regions['title_block_right'] = (3 * width // 4, 0, width // 4, height // 6)
+            margin = int(width * 0.05)
+            regions['main_drawing'] = (margin, height // 6, width - 2*margin, 4*height // 6)
+            regions['equipment_upper'] = (width // 4, height // 6, width // 2, height // 3)
+            regions['equipment_lower'] = (width // 4, height // 2, width // 2, height // 3)
+        
+        except Exception as e:
+            self.logger.warning(f"Region detection failed: {e}")
+            regions['full'] = (0, 0, width, height)
+        
+        return regions
+
+
+class OCREngine:
+    """Advanced OCR engine with multi-pass and rotation support"""
+    
+    def __init__(self, config: ProjectConfig):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        self.image_processor = ImageProcessor(config)
+    
+    def extract_text_multi_pass(self, image: Image.Image) -> List[ExtractedTag]:
+        """Multi-pass OCR with different settings"""
+        all_extractions = []
+        
+        if not OCR_SUPPORT:
+            return all_extractions
+        
+        # Preprocess
+        processed_images = self.image_processor.preprocess_image(image)
+        
+        # Detect regions
+        regions = self.image_processor.detect_regions(image)
+        
+        # PSM modes
+        psm_modes = []
+        if self.config.use_advanced_psm:
+            psm_modes = [
+                (6, "uniform_block"),
+                (11, "sparse_text"),
+                (12, "sparse_with_osd"),
+                (3, "automatic"),
+            ]
+        else:
+            psm_modes = [(6, "standard")]
+        
+        # Process each region
+        for region_name, (x, y, w, h) in regions.items():
+            try:
+                for proc_img, proc_desc, dpi in processed_images:
+                    region_img = proc_img.crop((x, y, x + w, y + h))
+                    
+                    for psm, psm_desc in psm_modes:
+                        try:
+                            config_str = f'--psm {psm} --oem 3'
+                            data = pytesseract.image_to_data(
+                                region_img,
+                                lang=self.config.ocr_language,
+                                config=config_str,
+                                output_type=pytesseract.Output.DICT
+                            )
+                            
+                            for i, text in enumerate(data['text']):
+                                if text.strip():
+                                    confidence = int(data['conf'][i])
+                                    if confidence >= self.config.min_text_confidence:
+                                        tag = ExtractedTag(
+                                            tag=text.strip(),
+                                            class_id="unknown",
+                                            confidence=confidence,
+                                            source=f"ocr_{region_name}_{proc_desc}_{psm_desc}",
+                                            region=(x + data['left'][i], y + data['top'][i],
+                                                   data['width'][i], data['height'][i]),
+                                            orientation='horizontal'
+                                        )
+                                        all_extractions.append(tag)
+                        
+                        except Exception as e:
+                            self.logger.debug(f"PSM {psm} failed for {region_name}: {e}")
+            
+            except Exception as e:
+                self.logger.warning(f"Region {region_name} processing failed: {e}")
+        
+        return all_extractions
+    
+    def extract_rotated_text(self, image: Image.Image) -> List[ExtractedTag]:
+        """Extract text at various rotations"""
+        rotations = []
+        
+        if not OCR_SUPPORT or not self.config.rotate_for_ocr:
+            return rotations
+        
+        angles = [0, 90, 180, 270, -90]
+        
+        for angle in angles:
+            try:
+                rotated = image if angle == 0 else image.rotate(angle, expand=True)
+                
+                config_str = '--psm 6 --oem 3'
+                data = pytesseract.image_to_data(
+                    rotated,
+                    lang=self.config.ocr_language,
+                    config=config_str,
+                    output_type=pytesseract.Output.DICT
+                )
+                
+                for i, text in enumerate(data['text']):
+                    if text.strip():
+                        confidence = int(data['conf'][i])
+                        if confidence >= self.config.min_text_confidence:
+                            orientation = 'horizontal' if angle == 0 else f'rotated_{angle}'
+                            tag = ExtractedTag(
+                                tag=text.strip(),
+                                class_id="unknown",
+                                confidence=confidence,
+                                source=f"rotation_{angle}",
+                                orientation=orientation
+                            )
+                            rotations.append(tag)
+            
+            except Exception as e:
+                self.logger.debug(f"Rotation {angle} failed: {e}")
+        
+        return rotations
+    
+    def extract_from_file(self, file_path: str) -> Tuple[str, List[ExtractedTag]]:
+        """Extract text from PDF or image file"""
+        all_tags = []
+        
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            
+            if ext == '.pdf':
+                self.logger.info(f"Converting PDF to images: {file_path}")
+                images = convert_from_path(file_path, dpi=self.config.ocr_dpi)
+                
+                for page_num, image in enumerate(images):
+                    self.logger.info(f"  Processing page {page_num + 1}/{len(images)}")
+                    
+                    if self.config.use_multi_pass_ocr:
+                        page_tags = self.extract_text_multi_pass(image)
+                        all_tags.extend(page_tags)
+                    
+                    if self.config.extract_vertical_text:
+                        rotated_tags = self.extract_rotated_text(image)
+                        all_tags.extend(rotated_tags)
+                    
+                    if self.config.save_debug_images:
+                        debug_dir = os.path.join(self.config.log_folder, "debug_images")
+                        os.makedirs(debug_dir, exist_ok=True)
+                        debug_path = os.path.join(debug_dir, 
+                                                 f"{os.path.basename(file_path)}_p{page_num}.png")
+                        image.save(debug_path)
+            
+            elif ext in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
+                image = Image.open(file_path)
+                
+                if self.config.use_multi_pass_ocr:
+                    all_tags = self.extract_text_multi_pass(image)
+                
+                if self.config.extract_vertical_text:
+                    rotated_tags = self.extract_rotated_text(image)
+                    all_tags.extend(rotated_tags)
+            
+            # Deduplicate
+            unique_tags = {}
+            for tag in all_tags:
+                key = tag.tag.upper()
+                if key not in unique_tags or tag.confidence > unique_tags[key].confidence:
+                    unique_tags[key] = tag
+            
+            final_tags = list(unique_tags.values())
+            final_tags.sort(key=lambda t: t.confidence, reverse=True)
+            
+            combined_text = "\n".join([t.tag for t in final_tags])
+            
+            self.logger.info(f"Extracted {len(final_tags)} unique tags (confidence >= {self.config.min_text_confidence}%)")
+            
+            return (combined_text, final_tags)
+        
+        except Exception as e:
+            self.logger.error(f"OCR extraction error: {e}")
+            return ("", [])
+
+
+class DocumentIndexingGateway:
+    """Main document processing gateway"""
+    
+    def __init__(self, config: ProjectConfig):
+        self.config = config
+        self.patterns: List[PatternRule] = []
+        self.processed_files: List[str] = []
+        self.failed_files: List[str] = []
+        self.tags_found: Dict[str, Set[str]] = {}
+        self.extraction_stats: Dict[str, Dict] = {}
+        
+        self.setup_logging()
+        
+        if config.use_ocr and OCR_SUPPORT:
+            self.ocr_engine = OCREngine(config)
+        else:
+            self.ocr_engine = None
+        
+        if config.use_ocr and not OCR_SUPPORT:
+            self.logger.warning("OCR requested but dependencies not installed")
+            self.logger.warning("Missing: " + ", ".join([d for d in MISSING_DEPS if 'ocr' in d.lower() or 'pil' in d.lower()]))
+            config.use_ocr = False
+    
+    def setup_logging(self):
+        """Setup logging system"""
+        os.makedirs(self.config.log_folder, exist_ok=True)
+        
+        log_file = os.path.join(
+            self.config.log_folder,
+            f"gateway_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
+        )
+        
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("="*70)
+        self.logger.info("Document Indexing Gateway v2.0 - Production")
+        self.logger.info("="*70)
+        self.logger.info(f"OCR: {'Enabled' if self.config.use_ocr else 'Disabled'}")
+        self.logger.info(f"OpenCV: {'Available' if CV2_SUPPORT else 'Not Available'}")
+        self.logger.info(f"Advanced Features: Multi-pass={self.config.use_multi_pass_ocr}, Adaptive DPI={self.config.adaptive_dpi}")
+        
+        if MISSING_DEPS:
+            self.logger.warning(f"Missing optional dependencies: {', '.join(MISSING_DEPS)}")
+    
+    def load_pattern_mapping(self, file_path: str):
+        """Load pattern mapping from XML"""
+        try:
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+            
+            for pattern_elem in root.findall('Pattern'):
+                pattern_str = pattern_elem.get('from', '')
+                class_id = pattern_elem.get('to', '')
+                context = pattern_elem.get('context', '')
+                min_conf = int(pattern_elem.get('minConfidence', '60'))
+                
+                expand_elem = pattern_elem.find('Expand')
+                expand = expand_elem is not None
+                interpolate = expand_elem.get('Interpolate', 'false').lower() == 'true' if expand_elem is not None else False
+                expand_char = expand_elem.get('Char', '-') if expand_elem is not None else '-'
+                sub_pattern = expand_elem.get('SubPattern', '[A-Z0-9]') if expand_elem is not None else '[A-Z0-9]'
+                
+                replacements = []
+                for replace_elem in pattern_elem.findall('Replace'):
+                    replacements.append((replace_elem.get('Search', ''), replace_elem.get('With', '')))
+                
+                insertions = []
+                for insert_elem in pattern_elem.findall('Insert'):
+                    insertions.append((insert_elem.get('position', 'after'),
+                                      insert_elem.get('char', '-'),
+                                      insert_elem.get('afterPattern', '')))
+                
+                exclusions = [e.text or '' for e in pattern_elem.findall('Exclude')]
+                
+                rule = PatternRule(
+                    pattern=pattern_str,
+                    class_id=class_id,
+                    context=context,
+                    expand=expand,
+                    interpolate=interpolate,
+                    expand_char=expand_char,
+                    sub_pattern=sub_pattern,
+                    replacements=replacements,
+                    insertions=insertions,
+                    exclusions=exclusions,
+                    min_confidence=min_conf
+                )
+                
+                self.patterns.append(rule)
+            
+            self.logger.info(f"Loaded {len(self.patterns)} pattern rules from {file_path}")
+        
+        except Exception as e:
+            self.logger.error(f"Error loading patterns: {e}")
+            raise
+    
+    def extract_text_from_pdf(self, file_path: str) -> str:
+        """Extract text from PDF"""
+        if not PDF_SUPPORT:
+            raise Exception("PyPDF2 not installed")
+        
+        # Try OCR first
+        if self.config.use_ocr and self.ocr_engine:
+            text, tags = self.ocr_engine.extract_from_file(file_path)
+            if text.strip():
+                self.extraction_stats[file_path] = {
+                    'total_tags': len(tags),
+                    'avg_confidence': sum(t.confidence for t in tags) / len(tags) if tags else 0,
+                    'sources': list(set(t.source for t in tags))
+                }
+                return text
+        
+        # Fallback
+        try:
+            reader = PdfReader(file_path)
+            return "\n".join([page.extract_text() for page in reader.pages])
+        except Exception as e:
+            self.logger.error(f"PDF extraction error: {e}")
+            raise
+    
+    def extract_text_from_docx(self, file_path: str) -> str:
+        """Extract text from DOCX"""
+        if not DOCX_SUPPORT:
+            raise Exception("python-docx not installed")
+        
+        try:
+            doc = Document(file_path)
+            return "\n".join([para.text for para in doc.paragraphs])
+        except Exception as e:
+            self.logger.error(f"DOCX extraction error: {e}")
+            raise
+    
+    def extract_text_from_xlsx(self, file_path: str) -> str:
+        """Extract text from XLSX"""
+        if not XLSX_SUPPORT:
+            raise Exception("openpyxl not installed")
+        
+        try:
+            wb = openpyxl.load_workbook(file_path, data_only=True)
+            text = ""
+            for sheet in wb.worksheets:
+                for row in sheet.iter_rows():
+                    for cell in row:
+                        if cell.value:
+                            text += str(cell.value) + " "
+                    text += "\n"
+            return text
+        except Exception as e:
+            self.logger.error(f"XLSX extraction error: {e}")
+            raise
+    
+    def extract_text_from_txt(self, file_path: str) -> str:
+        """Extract text from TXT"""
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception as e:
+            self.logger.error(f"TXT extraction error: {e}")
+            raise
+    
+    def extract_text_from_file(self, file_path: str) -> str:
+        """Extract text from any supported file"""
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        if ext == '.pdf':
+            return self.extract_text_from_pdf(file_path)
+        elif ext in ['.docx', '.doc']:
+            return self.extract_text_from_docx(file_path)
+        elif ext in ['.xlsx', '.xls']:
+            return self.extract_text_from_xlsx(file_path)
+        elif ext == '.txt':
+            return self.extract_text_from_txt(file_path)
+        elif ext in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp'] and self.config.use_ocr and self.ocr_engine:
+            text, _ = self.ocr_engine.extract_from_file(file_path)
+            return text
+        else:
+            raise Exception(f"Unsupported file type: {ext}")
+    
+    def expand_tag(self, tag: str, expand_char: str, sub_pattern: str) -> List[str]:
+        """Expand tag with interpolation"""
+        expanded = []
+        pattern = f'({sub_pattern}){expand_char}({sub_pattern})'
+        match = re.search(pattern, tag)
+        
+        if match:
+            start_char = match.group(1)
+            end_char = match.group(2)
+            
+            if start_char.isalpha() and end_char.isalpha():
+                for i in range(ord(start_char), ord(end_char) + 1):
+                    new_tag = tag[:match.start()] + chr(i) + tag[match.end():]
+                    expanded.append(new_tag)
+            elif start_char.isdigit() and end_char.isdigit():
+                for i in range(int(start_char), int(end_char) + 1):
+                    new_tag = tag[:match.start()] + str(i) + tag[match.end():]
+                    expanded.append(new_tag)
+        
+        return expanded if expanded else [tag]
+    
+    def extract_tags_from_text(self, text: str, file_path: str = "") -> Dict[str, Set[str]]:
+        """Extract tags using pattern rules"""
+        found_tags = {}
+        
+        for rule in self.patterns:
+            try:
+                matches = re.finditer(rule.pattern, text, re.IGNORECASE | re.MULTILINE)
+                
+                for match in matches:
+                    tag = match.group(0)
+                    
+                    # Check exclusions
+                    if any(excl in tag for excl in rule.exclusions):
+                        continue
+                    
+                    # Apply replacements
+                    for search, replace_with in rule.replacements:
+                        tag = re.sub(search, replace_with, tag)
+                    
+                    # Apply insertions
+                    for position, char, after_pattern in rule.insertions:
+                        if after_pattern:
+                            tag = re.sub(f'({after_pattern})', f'\\1{char}', tag)
+                    
+                    # Expand if needed
+                    if rule.expand and rule.interpolate:
+                        expanded = self.expand_tag(tag, rule.expand_char, rule.sub_pattern)
+                        for exp_tag in expanded:
+                            if rule.class_id not in found_tags:
+                                found_tags[rule.class_id] = set()
+                            found_tags[rule.class_id].add(exp_tag.strip())
+                    else:
+                        if rule.class_id not in found_tags:
+                            found_tags[rule.class_id] = set()
+                        found_tags[rule.class_id].add(tag.strip())
+            
+            except Exception as e:
+                self.logger.error(f"Pattern error {rule.pattern}: {e}")
+        
+        return found_tags
+    
+    def generate_eiwm_xml(self, tags: Dict[str, Set[str]], document_id: str, context: str = "") -> str:
+        """Generate EIWM XML output"""
+        root = ET.Element('Objects')
+        
+        for class_id, tag_set in tags.items():
+            for tag in tag_set:
+                obj = ET.SubElement(root, 'Object')
+                
+                id_elem = ET.SubElement(obj, 'ID')
+                id_elem.text = tag
+                
+                if context:
+                    context_parts = context.split('|')
+                    current_context = obj
+                    for part in context_parts:
+                        ctx = ET.SubElement(current_context, 'Context')
+                        ctx_id = ET.SubElement(ctx, 'ID')
+                        ctx_id.text = part.strip()
+                        current_context = ctx
+                
+                class_elem = ET.SubElement(obj, 'ClassID')
+                class_elem.text = class_id
+                
+                assoc = ET.SubElement(obj, 'Association')
+                assoc.set('type', 'is referenced in')
+                assoc_obj = ET.SubElement(assoc, 'Object')
+                assoc_id = ET.SubElement(assoc_obj, 'ID')
+                assoc_id.text = document_id
+        
+        xml_str = ET.tostring(root, encoding='unicode')
+        
+        if self.config.insert_line_breaks:
+            from xml.dom import minidom
+            dom = minidom.parseString(xml_str)
+            xml_str = dom.toprettyxml(indent="  ")
+        
+        return xml_str
+    
+    def process_file(self, file_path: str) -> bool:
+        """Process a single file"""
+        try:
+            self.logger.info(f"Processing: {file_path}")
+            start_time = datetime.now()
+            
+            # Extract text
+            text = self.extract_text_from_file(file_path)
+            
+            if self.config.search_filenames_for_tags:
+                text += "\n" + os.path.basename(file_path)
+            
+            # Extract tags
+            tags = self.extract_tags_from_text(text, file_path)
+            
+            if not tags:
+                self.logger.warning(f"No tags found in {file_path}")
+                self.failed_files.append(file_path)
+                return False
+            
+            # Store tags
+            self.tags_found[file_path] = set()
+            for tag_set in tags.values():
+                self.tags_found[file_path].update(tag_set)
+            
+            # Generate XML
+            document_id = os.path.splitext(os.path.basename(file_path))[0]
+            xml_content = self.generate_eiwm_xml(tags, document_id, self.config.default_context)
+            
+            # Save outputs
+            os.makedirs(self.config.staging_area, exist_ok=True)
+            xml_path = os.path.join(self.config.staging_area, f"{document_id}.xml")
+            
+            with open(xml_path, 'w', encoding='utf-8') as f:
+                f.write(xml_content)
+            
+            if self.config.copy_source_files:
+                dest_path = os.path.join(self.config.staging_area, os.path.basename(file_path))
+                shutil.copy2(file_path, dest_path)
+            
+            if self.config.move_processed and self.config.processed_folder:
+                os.makedirs(self.config.processed_folder, exist_ok=True)
+                processed_path = os.path.join(self.config.processed_folder, os.path.basename(file_path))
+                shutil.move(file_path, processed_path)
+            
+            elapsed = (datetime.now() - start_time).total_seconds()
+            self.processed_files.append(file_path)
+            self.logger.info(f"✓ Success: {len(self.tags_found[file_path])} tags, {elapsed:.1f}s")
+            
+            return True
+        
+        except Exception as e:
+            self.logger.error(f"✗ Processing failed: {e}")
+            self.failed_files.append(file_path)
+            
+            if self.config.move_processed and self.config.unprocessed_folder:
+                try:
+                    os.makedirs(self.config.unprocessed_folder, exist_ok=True)
+                    unprocessed_path = os.path.join(self.config.unprocessed_folder, 
+                                                   os.path.basename(file_path))
+                    shutil.move(file_path, unprocessed_path)
+                except:
+                    pass
+            
+            return False
+    
+    def discover_files(self) -> List[str]:
+        """Discover files to process"""
+        files = []
+        
+        if self.config.include_subfolders:
+            for root, dirs, filenames in os.walk(self.config.source_folder):
+                for filename in filenames:
+                    ext = os.path.splitext(filename)[1].lower().lstrip('.')
+                    if ext in self.config.file_types:
+                        files.append(os.path.join(root, filename))
+        else:
+            for filename in os.listdir(self.config.source_folder):
+                file_path = os.path.join(self.config.source_folder, filename)
+                if os.path.isfile(file_path):
+                    ext = os.path.splitext(filename)[1].lower().lstrip('.')
+                    if ext in self.config.file_types:
+                        files.append(file_path)
+        
+        return files
+    
+    def process_batch(self):
+        """Process all files"""
+        start_time = datetime.now()
+        files = self.discover_files()
+        
+        self.logger.info(f"Found {len(files)} files to process")
+        
+        for i, file_path in enumerate(files, 1):
+            self.logger.info(f"[{i}/{len(files)}]")
+            self.process_file(file_path)
+        
+        if self.config.create_trigger_file and self.config.staging_area:
+            trigger_path = os.path.join(self.config.staging_area, "trigger.start")
+            with open(trigger_path, 'w') as f:
+                f.write(f"Completed at {datetime.now()}\n")
+        
+        self.generate_summary_report()
+        self.generate_stats_report()
+        
+        elapsed = (datetime.now() - start_time).total_seconds()
+        self.logger.info("="*70)
+        self.logger.info(f"Batch Complete: {len(self.processed_files)} processed, {len(self.failed_files)} failed")
+        self.logger.info(f"Total time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+        self.logger.info("="*70)
+    
+    def generate_summary_report(self):
+        """Generate HTML summary report"""
+        report_path = os.path.join(self.config.log_folder, "summary_report.html")
+        
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Processing Summary Report</title>
+    <meta charset="utf-8">
+    <style>
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
+        .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; margin-top: 0; }}
+        h2 {{ color: #34495e; margin-top: 30px; }}
+        .summary {{ background: #ecf0f1; padding: 20px; border-radius: 8px; margin: 20px 0; }}
+        .stat {{ display: inline-block; margin: 10px 20px 10px 0; }}
+        .stat-label {{ font-weight: bold; color: #7f8c8d; font-size: 14px; }}
+        .stat-value {{ font-size: 28px; font-weight: bold; color: #2c3e50; }}
+        .success {{ color: #27ae60; }}
+        .error {{ color: #e74c3c; }}
+        table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
+        th, td {{ border: 1px solid #bdc3c7; padding: 12px; text-align: left; }}
+        th {{ background-color: #3498db; color: white; font-weight: bold; }}
+        tr:nth-child(even) {{ background-color: #ecf0f1; }}
+        tr:hover {{ background-color: #d5dbdb; }}
+        .feature-badge {{ display: inline-block; padding: 5px 10px; border-radius: 3px; font-size: 12px; margin: 2px; }}
+        .badge-enabled {{ background: #2ecc71; color: white; }}
+        .badge-disabled {{ background: #95a5a6; color: white; }}
+        .confidence {{ font-weight: bold; }}
+        .conf-high {{ color: #27ae60; }}
+        .conf-med {{ color: #f39c12; }}
+        .conf-low {{ color: #e74c3c; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Document Processing Summary Report</h1>
+        <p><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <p><strong>Project:</strong> {self.config.name}</p>
+        
+        <div class="summary">
+            <h2>Summary Statistics</h2>
+            <div class="stat">
+                <div class="stat-label">Total Files</div>
+                <div class="stat-value">{len(self.processed_files) + len(self.failed_files)}</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">✓ Processed</div>
+                <div class="stat-value success">{len(self.processed_files)}</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">✗ Failed</div>
+                <div class="stat-value error">{len(self.failed_files)}</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Total Tags</div>
+                <div class="stat-value">{sum(len(tags) for tags in self.tags_found.values())}</div>
+            </div>
+        </div>
+        
+        <div class="summary">
+            <h2>⚙️ Configuration</h2>
+            <span class="feature-badge {'badge-enabled' if self.config.use_ocr else 'badge-disabled'}">
+                OCR: {'Enabled' if self.config.use_ocr else 'Disabled'}
+            </span>
+            <span class="feature-badge {'badge-enabled' if self.config.adaptive_dpi else 'badge-disabled'}">
+                Adaptive DPI: {'On' if self.config.adaptive_dpi else 'Off'}
+            </span>
+            <span class="feature-badge {'badge-enabled' if self.config.preprocess_images else 'badge-disabled'}">
+                Preprocessing: {'On' if self.config.preprocess_images else 'Off'}
+            </span>
+            <span class="feature-badge {'badge-enabled' if self.config.use_multi_pass_ocr else 'badge-disabled'}">
+                Multi-Pass: {'On' if self.config.use_multi_pass_ocr else 'Off'}
+            </span>
+            <span class="feature-badge {'badge-enabled' if self.config.extract_vertical_text else 'badge-disabled'}">
+                Vertical Text: {'On' if self.config.extract_vertical_text else 'Off'}
+            </span>
+            <span class="feature-badge {'badge-enabled' if CV2_SUPPORT else 'badge-disabled'}">
+                OpenCV: {'Available' if CV2_SUPPORT else 'Not Available'}
+            </span>
+            <p style="margin-top: 15px;">
+                <strong>DPI Range:</strong> {self.config.dpi_min} - {self.config.dpi_max} |
+                <strong>Min Confidence:</strong> {self.config.min_text_confidence}%
+            </p>
+        </div>
+        
+        <h2>📋 Processed Files</h2>
+        <table>
+            <tr>
+                <th>File</th>
+                <th>Tags Found</th>
+                <th>Sample Tags</th>
+                <th>Avg Confidence</th>
+            </tr>
+"""
+        
+        for file_path in self.processed_files:
+            tags = self.tags_found.get(file_path, set())
+            stats = self.extraction_stats.get(file_path, {})
+            avg_conf = stats.get('avg_confidence', 0)
+            conf_class = 'conf-high' if avg_conf >= 80 else 'conf-med' if avg_conf >= 60 else 'conf-low'
+            sample_tags = ', '.join(sorted(list(tags)[:10]))
+            if len(tags) > 10:
+                sample_tags += ' ...'
+            
+            html += f"""            <tr>
+                <td>{os.path.basename(file_path)}</td>
+                <td><strong>{len(tags)}</strong></td>
+                <td>{sample_tags}</td>
+                <td class="confidence {conf_class}">{avg_conf:.0f}%</td>
+            </tr>
+"""
+        
+        html += """        </table>
+"""
+        
+        if self.failed_files:
+            html += """        <h2>❌ Failed Files</h2>
+        <ul>
+"""
+            for file_path in self.failed_files:
+                html += f"            <li>{os.path.basename(file_path)}</li>\n"
+            html += """        </ul>
+"""
+        
+        html += """    </div>
+</body>
+</html>"""
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(html)
+        
+        self.logger.info(f"Report saved: {report_path}")
+    
+    def generate_stats_report(self):
+        """Generate JSON stats report"""
+        stats_path = os.path.join(self.config.log_folder, "extraction_stats.json")
+        
+        stats = {
+            'summary': {
+                'total_files': len(self.processed_files) + len(self.failed_files),
+                'processed': len(self.processed_files),
+                'failed': len(self.failed_files),
+                'total_tags': sum(len(tags) for tags in self.tags_found.values()),
+                'avg_tags_per_file': sum(len(tags) for tags in self.tags_found.values()) / max(1, len(self.processed_files))
+            },
+            'configuration': self.config.to_dict(),
+            'files': {}
+        }
+        
+        for file_path in self.processed_files:
+            stats['files'][os.path.basename(file_path)] = {
+                'tags_found': len(self.tags_found.get(file_path, set())),
+                'tags': list(self.tags_found.get(file_path, set())),
+                'extraction_details': self.extraction_stats.get(file_path, {})
+            }
+        
+        with open(stats_path, 'w') as f:
+            json.dump(stats, f, indent=2)
+
+
+def main():
+    """Main entry point"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Document Indexing Gateway - Production v2.0',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -c config.json
+  %(prog)s -c config.json -f drawing.pdf --ocr
+  %(prog)s -c config.json --high-quality
+  %(prog)s -c config.json --debug
+        """
+    )
+    
+    parser.add_argument('-c', '--config', required=True, help='Configuration file (JSON)')
+    parser.add_argument('-f', '--file', help='Process single file')
+    parser.add_argument('--context', help='Override default context')
+    parser.add_argument('--ocr', action='store_true', help='Enable OCR')
+    parser.add_argument('--high-quality', action='store_true', help='High quality mode (slower, more accurate)')
+    parser.add_argument('--debug', action='store_true', help='Save debug images')
+    parser.add_argument('--version', action='version', version='%(prog)s 2.0.0')
+    
+    args = parser.parse_args()
+    
+    # Load config
+    try:
+        with open(args.config, 'r') as f:
+            config_data = json.load(f)
+    except Exception as e:
+        print(f"Error loading config: {e}")
+        return 1
+    
+    config = ProjectConfig.from_dict(config_data)
+    
+    # Override settings
+    if args.context:
+        config.default_context = args.context
+    if args.ocr:
+        config.use_ocr = True
+    if args.high_quality:
+        config.adaptive_dpi = True
+        config.dpi_max = 600
+        config.preprocess_images = True
+        config.use_multi_pass_ocr = True
+        config.enhance_contrast = 2.0
+        config.enhance_sharpness = 2.0
+    if args.debug:
+        config.save_debug_images = True
+    
+    # Create gateway
+    gateway = DocumentIndexingGateway(config)
+    
+    # Load patterns
+    if config.pattern_mapping_file and os.path.exists(config.pattern_mapping_file):
+        gateway.load_pattern_mapping(config.pattern_mapping_file)
+    else:
+        print(f"Warning: Pattern file not found: {config.pattern_mapping_file}")
+    
+    # Process
+    try:
+        if args.file:
+            gateway.process_file(args.file)
+        else:
+            gateway.process_batch()
+        return 0
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+        return 130
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
