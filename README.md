@@ -576,8 +576,6 @@ Expected Capture: 80-95% (32-38 out of 40 tags)
 ✅ **High-quality & fast modes**  
 ✅ **Debug mode with image saving**  
 
-**Everything we discussed is in ONE production-ready script!** 🚀
-
 ---
 
 *Document Indexing Gateway v2.0.0*  
